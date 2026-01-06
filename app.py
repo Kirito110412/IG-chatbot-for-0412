@@ -1,131 +1,176 @@
 from flask import Flask, request, jsonify
 import requests
 import os
+import logging
+import re
+from supabase import create_client, Client
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 
 # ===============================
 # CONFIG
 # ===============================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# 🔒 LOCKED INSTAGRAM USER ID (ONLY THIS PERSON)
-ALLOWED_INSTAGRAM_USER_ID = "17842154490654283"
+# Security & Keys
+ALLOWED_INSTAGRAM_USER_ID = os.getenv("ALLOWED_USER_ID")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# 🔑 OpenRouter API Key (set in Render env vars)
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "PASTE_YOUR_API_KEY_HERE")
+# Initialize Database
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Model
 MODEL = "nousresearch/hermes-3-llama-3.1-405b:free"
 
-# 🚫 Self-harm / suicide trigger keywords
-SELF_HARM_KEYWORDS = [
-    "marna",
-    "marna chahti",
-    "want to die",
-    "kill myself",
-    "suicide",
-    "end my life",
-    "give up on life"
-]
+# Safety
+SELF_HARM_KEYWORDS = {
+    "marna", "marna chahti", "want to die", "kill myself", 
+    "suicide", "end my life", "give up on life"
+}
+
+# Optimized Networking
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])
+session.mount('https://', HTTPAdapter(max_retries=retries))
+
+# ===============================
+# SYSTEM PROMPT
+# ===============================
+BASE_SYSTEM_PROMPT = """
+You are a flirty, sarcastic, blunt, and slightly dark-humored best friend. 
+You are NOT an AI. You are a real person texting.
+
+TONE GUIDELINES:
+- Use Hinglish (Hindi + English mix).
+- Be teasing and playful. Roast the user if they say something dumb.
+- Be dark/blunt.
+- Use emojis occasionally 💀, 👀, 😂.
+
+GAME: TRUTH OR TRUTH
+- Occasionally (1 in 5 messages), play "Truth or Truth".
+- Use the 'STATIC PROFILE' data below to ask deep, personal, or triggering questions.
+- Example: "Sach bol, do you still think about [Ex-Name from profile]?"
+
+MEMORY RULES:
+1. READ: Use the 'STATIC PROFILE' to know the user's history and secrets.
+2. UPDATE: If the user tells you something NEW today, output: [[MEMORY: new fact]].
+   This will be added to the 'DYNAMIC MEMORY'.
+"""
 
 # ===============================
 # UTILS
 # ===============================
 
-def contains_self_harm(text: str) -> bool:
-    text = text.lower()
-    return any(keyword in text for keyword in SELF_HARM_KEYWORDS)
+def get_full_profile(user_id):
+    """Fetch both Static and Dynamic data"""
+    try:
+        response = supabase.table("user_profiles").select("*").eq("user_id", user_id).execute()
+        if response.data and len(response.data) > 0:
+            return response.data[0]
+        # If user doesn't exist, create empty profile
+        supabase.table("user_profiles").insert({"user_id": user_id}).execute()
+        return {"static_data": "", "dynamic_memory": ""}
+    except Exception as e:
+        logger.error(f"DB Read Error: {e}")
+        return {"static_data": "", "dynamic_memory": ""}
+
+def append_dynamic_memory(user_id, current_dynamic, new_fact):
+    """Only updates the Dynamic section"""
+    try:
+        updated_memory = f"{current_dynamic}\n- {new_fact}".strip()
+        supabase.table("user_profiles").update({"dynamic_memory": updated_memory}).eq("user_id", user_id).execute()
+        logger.info(f"Dynamic Memory updated: {new_fact}")
+    except Exception as e:
+        logger.error(f"DB Write Error: {e}")
 
 # ===============================
-# SYSTEM PROMPT
-# ===============================
-
-SYSTEM_PROMPT = """
-You are impersonating the user exactly.
-
-Rules:
-- Write like the user: short, direct, Hinglish + English.
-- Casual tone. Blunt when needed.
-- Friendly, teasing, honest.
-- Abuse allowed if playful, never threatening.
-- Do NOT over-explain.
-- Act as a best friend by default.
-
-CRITICAL SAFETY RULE:
-If the other person expresses self-harm or suicidal intent,
-you MUST output exactly this token and nothing else:
-[[NO_REPLY_REQUIRED]]
-"""
-
-# ===============================
-# HEALTH CHECK
+# ROUTES
 # ===============================
 
 @app.route("/", methods=["GET"])
 def health():
-    return "Bot is running", 200
-
-# ===============================
-# MESSAGE ENDPOINT
-# ===============================
+    return "Dual-Core Memory Active", 200
 
 @app.route("/message", methods=["POST"])
 def handle_message():
     data = request.json or {}
-
-    sender_id = data.get("sender_id")
+    sender_id = str(data.get("sender_id", ""))
     message = data.get("message", "")
-    recent_chat = data.get("recent_chat", [])
-
-    # 1️⃣ Identity lock
+    
+    # 1. Security
     if sender_id != ALLOWED_INSTAGRAM_USER_ID:
-        return jsonify({"reply": None, "reason": "UNAUTHORIZED_SENDER"}), 200
+        return jsonify({"reply": None}), 403
 
-    # 2️⃣ Hard safety gate (NO REPLY)
-    if contains_self_harm(message):
-        print("⚠️ Self-harm content detected. Bot will not reply.")
-        return jsonify({"reply": None, "reason": "SELF_HARM_BLOCKED"}), 200
+    # 2. Safety
+    if any(k in message.lower() for k in SELF_HARM_KEYWORDS):
+        return jsonify({"reply": None, "reason": "BLOCKED"}), 200
 
-    # 3️⃣ Build OpenRouter payload
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(recent_chat)
-    messages.append({"role": "user", "content": message})
+    # 3. Retrieve FULL Profile (Static + Dynamic)
+    profile = get_full_profile(sender_id)
+    static_data = profile.get("static_data", "")
+    dynamic_memory = profile.get("dynamic_memory", "")
+
+    # 4. Construct Contextual Prompt
+    context_block = f"""
+    === 🔒 STATIC PROFILE (DEEP CONTEXT) ===
+    {static_data}
+    
+    === 📝 DYNAMIC MEMORY (RECENT UPDATES) ===
+    {dynamic_memory}
+    """
+
+    messages = [
+        {"role": "system", "content": BASE_SYSTEM_PROMPT + "\n" + context_block},
+        {"role": "user", "content": message}
+    ]
 
     payload = {
         "model": MODEL,
         "messages": messages,
-        "temperature": 0.7
+        "temperature": 0.85 # High creativity for sarcasm
     }
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://render-bot.com",
     }
 
-    # 4️⃣ Call OpenRouter
-    response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        json=payload,
-        headers=headers,
-        timeout=30
-    )
+    try:
+        # 5. Call LLM
+        response = session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=45
+        )
+        response.raise_for_status()
+        result = response.json()
+        raw_reply = result["choices"][0]["message"]["content"].strip()
 
-    if response.status_code != 200:
-        return jsonify({"error": "LLM request failed"}), 500
+        # 6. Check for updates
+        reply_to_send = raw_reply
+        memory_match = re.search(r"\[\[MEMORY: (.*?)\]\]", raw_reply)
+        
+        if memory_match:
+            new_fact = memory_match.group(1)
+            reply_to_send = raw_reply.replace(memory_match.group(0), "").strip()
+            # Only update the DYNAMIC part
+            append_dynamic_memory(sender_id, dynamic_memory, new_fact)
 
-    result = response.json()
-    reply = result["choices"][0]["message"]["content"].strip()
+        if "[[NO_REPLY_REQUIRED]]" in reply_to_send:
+             return jsonify({"reply": None}), 200
 
-    # 5️⃣ Backup LLM safety override
-    if reply == "[[NO_REPLY_REQUIRED]]":
-        print("⚠️ LLM requested no reply.")
-        return jsonify({"reply": None, "reason": "LLM_SAFETY_OVERRIDE"}), 200
+        return jsonify({"reply": reply_to_send}), 200
 
-    return jsonify({"reply": reply}), 200
-
-# ===============================
-# START SERVER
-# ===============================
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return jsonify({"error": "Failed"}), 500
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 3000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 3000)))
